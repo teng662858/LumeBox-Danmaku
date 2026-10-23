@@ -9,7 +9,7 @@
     "test": "node --test --test-concurrency=1",
     "build-forward-widget": "node build-forward-widget.js",
     "build-forward-widget:debug": "node build-forward-widget.js --debug",
-    "deploy": "wrangler deploy"
+    "deploy": "node tools/deploy-worker.mjs"
   },
   "author": "",
   "license": "ISC",

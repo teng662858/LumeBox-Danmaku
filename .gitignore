@@ -8,3 +8,5 @@ dist
 *.log
 .wrangler/
 .deploy-preview/
+
+.env.*
