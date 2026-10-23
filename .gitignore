@@ -4,3 +4,7 @@ node_modules
 .env
 .cache
 dist
+
+*.log
+.wrangler/
+.deploy-preview/
