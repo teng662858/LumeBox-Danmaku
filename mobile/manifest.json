@@ -1,0 +1,8 @@
+{
+  "project": "https://github.com/huangxd-/danmu_api",
+  "version": "1.21.9",
+  "patchedSha256": "9d0e9be4c278949f7ae5b063e1e7cef90bfb0f9be22d1f10a61d8649fae8685a",
+  "upstreamTagCommit": "d4e9447c3fff14d0a71871da7a6c450ecdbee36f",
+  "adapterSha256": "0e6530ef893499c5c8ed4b291a9a83e2e70be0f7a1e41fb92dcb0b7efa6e7dc4",
+  "build": "tool/build_builtin_danmaku.mjs"
+}

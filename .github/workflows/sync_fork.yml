@@ -39,8 +39,18 @@ jobs:
       - run: npm install --no-audit --no-fund
       - run: npm test
       - run: npm run deploy -- --dry-run
+      - name: Build signed mobile component
+        env:
+          BUILTIN_SIGNING_KEY: ${{ secrets.BUILTIN_SIGNING_KEY }}
+        run: |
+          if test -n "$BUILTIN_SIGNING_KEY"; then
+            node tools/build-mobile.mjs . mobile
+          else
+            echo "Mobile release not published: signing key is stored locally."
+          fi
       - name: Publish validated update
         run: |
+          git add mobile
           if test -f .git/MERGE_HEAD || ! git diff --cached --quiet; then
             git commit -m "Sync validated upstream danmu_api"
             git push origin HEAD:main
