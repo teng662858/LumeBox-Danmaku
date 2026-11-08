@@ -1,15 +1,18 @@
-// 请求级端点测试：欢迎页与请求体（分块/多字节/multipart）处理
-// 由原单文件测试 worker.test.js 机械拆分而来，用例名与断言未做改动。
+// 请求级端点测试：欢迎页、请求体（分块/多字节/multipart）与弹幕偏移处理
+// 由原单文件测试 worker.test.js 机械拆分而来；弹幕偏移用例覆盖规则/链接偏移的返回时长与匹配日志。
 
 import dotenv from 'dotenv';
 dotenv.config();
 
 import test from 'node:test';
 import assert from 'node:assert';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import { Readable } from 'node:stream';
 import { parseLocalDanmu } from '../utils/local-danmu-parser.js';
 import { handleRequest, netlifyHandler, vercelHandler } from '../worker.js';
-import { MockRequest, parseResponse, readRequestBody, urlPrefix } from './helpers/context.js';
+import { MockRequest, parseResponse, readRequestBody, urlPrefix, withMockFetch } from './helpers/context.js';
 import { localDanmuEncodings, localDanmuExpected, localDanmuJson } from './helpers/local-danmu.js';
 import { matchAnime, searchAnime } from '../apis/dandan-api.js';
 import { Globals } from '../configs/globals.js';
@@ -18,8 +21,17 @@ import BilibiliSource from '../sources/bilibili.js';
 import IqiyiSource from '../sources/iqiyi.js';
 import TencentSource from '../sources/tencent.js';
 import YoukuSource from '../sources/youku.js';
-import { addAnime, addEpisode } from '../utils/cache-util.js';
+import { addAnime, addEpisode, setSearchCache } from '../utils/cache-util.js';
 import { createSearchResult, resetSearchState } from './helpers/context.js';
+import { createFavoriteAnime, favoriteSearchResult } from './helpers/favorites.js';
+import {
+  ensureRemoteTitleMapping,
+  millisecondsUntilNextShanghaiRefresh,
+  normalizeMappingSourceUrl,
+  parseRemoteTitleMappings,
+  refreshRemoteTitleMappingNow,
+} from '../utils/remote-title-mapping-util.js';
+import { resetRemoteAutoMatchMappingForTests } from '../utils/auto-match-mapping-url-util.js';
 
 test('GET / should return welcome message', async () => {
     const req = new MockRequest(urlPrefix, { method: 'GET' });
@@ -188,6 +200,166 @@ test('GET /api/v2/comment/:id?format=json&duration=true should prefer explicit d
     BilibiliSource.prototype.getComments = originalBilibiliGetComments;
     Globals.episodeIds = [];
     Globals.commentCache = new Map();
+  }
+});
+
+test('GET /api/v2/comment/:id applies rule offset to videoDuration', async () => {
+  Globals.init({});
+  Globals.animes = [];
+  Globals.episodeIds = [];
+  Globals.episodeNum = 10001;
+  Globals.commentCache = new Map();
+  Globals.requestHistory = new Map();
+  Globals.logBuffer.length = 0;
+
+  const env = { DANMU_OFFSET: '钢铁侠2@bilibili%:270' };
+  const originalBilibiliGetComments = BilibiliSource.prototype.getComments;
+  let commentFetches = 0;
+  let segmentFetches = 0;
+  BilibiliSource.prototype.getComments = async function(url, plat, segmentFlag) {
+    if (segmentFlag) {
+      segmentFetches += 1;
+      return new SegmentListResponse({
+        type: 'bilibili1',
+        duration: 7173,
+        segmentList: [{ type: 'bilibili1', segment_start: 0, segment_end: 7173, url: 'mock-bili-1' }]
+      });
+    }
+    commentFetches += 1;
+    return Array.from({ length: 120 }, () => ({ p: '0.36,1,16777215,bilibili1', m: '弹幕' }));
+  };
+
+  try {
+    addAnime({
+      animeId: 5030376, bangumiId: 'ss46058', animeTitle: '钢铁侠2(2010)【电影】from bilibili',
+      type: 'movie', typeDescription: '电影', source: 'bilibili',
+      links: [{ title: '【bilibili1】 原版', url: 'https://www.bilibili.com/bangumi/play/ep777132' }],
+    });
+    const episode = Globals.animes.find(anime => anime.animeId === 5030376).links[0];
+    const request = () => new MockRequest(
+      urlPrefix + '/api/v2/comment/' + episode.id + '?format=json&duration=true',
+      { method: 'GET' }
+    );
+
+    const first = await parseResponse(await handleRequest(request(), env, undefined, 'offset-rule-test'));
+    assert.equal(first.videoDuration, 7443, '规则百分比偏移换算进总时长');
+    assert.equal(segmentFetches, 1, '首次请求只解析一次时长');
+    assert.equal(first.comments[0].p.split(',')[0], '0.37');
+    assert.ok(Globals.logBuffer.some(entry => entry.message === '[system] [offset] 钢铁侠2 命中偏移规则: 钢铁侠2@bilibili%:270'),
+      '命中规则时记录日志');
+
+    const cached = await parseResponse(await handleRequest(request(), env, undefined, 'offset-rule-test'));
+    assert.equal(cached.videoDuration, 7443, '缓存命中时同样返回偏移后的时长');
+    assert.equal(commentFetches, 1, '第二次请求命中缓存，未重新拉取弹幕');
+
+    addAnime({
+      animeId: 5030999, bangumiId: 'ss46059', animeTitle: '钢铁侠3(2013)【电影】from bilibili',
+      type: 'movie', typeDescription: '电影', source: 'bilibili',
+      links: [{ title: '【bilibili1】 原版', url: 'https://www.bilibili.com/bangumi/play/ep888' }],
+    });
+    const otherEpisode = Globals.animes.find(anime => anime.animeId === 5030999).links[0];
+    Globals.logBuffer.length = 0;
+    const miss = await parseResponse(await handleRequest(new MockRequest(
+      urlPrefix + '/api/v2/comment/' + otherEpisode.id + '?format=json&duration=true',
+      { method: 'GET' }
+    ), env, undefined, 'offset-rule-test'));
+    assert.equal(miss.videoDuration, 7173, '未命中规则时时长保持原值');
+    assert.ok(Globals.logBuffer.some(entry => entry.message === '[system] [offset] 钢铁侠3 未命中偏移规则'),
+      '未命中规则时记录日志');
+  } finally {
+    BilibiliSource.prototype.getComments = originalBilibiliGetComments;
+    Globals.init({});
+    Globals.episodeIds = [];
+    Globals.commentCache = new Map();
+    Globals.requestHistory = new Map();
+    Globals.logBuffer.length = 0;
+  }
+});
+
+test('GET /api/v2/comment/:id applies link offset to videoDuration', async () => {
+  Globals.init({});
+  Globals.animes = [];
+  Globals.episodeIds = [];
+  Globals.episodeNum = 10001;
+  Globals.commentCache = new Map();
+  Globals.requestHistory = new Map();
+
+  const originalBilibiliGetComments = BilibiliSource.prototype.getComments;
+  let commentFetches = 0;
+  BilibiliSource.prototype.getComments = async function(url, plat, segmentFlag) {
+    if (segmentFlag) {
+      return new SegmentListResponse({
+        type: 'bilibili1',
+        duration: 1000,
+        segmentList: [{ type: 'bilibili1', segment_start: 0, segment_end: 1000, url: 'mock-bili-1' }]
+      });
+    }
+    commentFetches += 1;
+    return Array.from({ length: 120 }, () => ({ p: '500.0,1,16777215,bilibili1', m: '一半' }));
+  };
+
+  try {
+    const episode = addEpisode('https://www.bilibili.com/bangumi/play/ep_link.html@%100', '【bilibili1】 链接偏移');
+    const request = () => new MockRequest(
+      urlPrefix + '/api/v2/comment/' + episode.id + '?format=json&duration=true',
+      { method: 'GET' }
+    );
+
+    const first = await parseResponse(await handleRequest(request(), undefined, undefined, 'offset-link-test'));
+    assert.equal(first.videoDuration, 1100, '链接百分比偏移换算进总时长');
+    assert.equal(first.comments[0].p.split(',')[0], '600.00');
+
+    const cached = await parseResponse(await handleRequest(request(), undefined, undefined, 'offset-link-test'));
+    assert.equal(cached.videoDuration, 1100, '缓存命中时同样返回偏移后的时长');
+    assert.equal(commentFetches, 1, '第二次请求命中缓存，未重新拉取弹幕');
+  } finally {
+    BilibiliSource.prototype.getComments = originalBilibiliGetComments;
+    Globals.episodeIds = [];
+    Globals.commentCache = new Map();
+    Globals.requestHistory = new Map();
+  }
+});
+
+test('GET /api/v2/comment/:id applies link and rule offsets to videoDuration', async () => {
+  Globals.init({});
+  Globals.animes = [];
+  Globals.episodeIds = [];
+  Globals.episodeNum = 10001;
+  Globals.commentCache = new Map();
+  Globals.requestHistory = new Map();
+
+  const env = { DANMU_OFFSET: '钢铁侠2@bilibili%:270' };
+  const originalBilibiliGetComments = BilibiliSource.prototype.getComments;
+  BilibiliSource.prototype.getComments = async function(url, plat, segmentFlag) {
+    if (segmentFlag) {
+      return new SegmentListResponse({
+        type: 'bilibili1',
+        duration: 7173,
+        segmentList: [{ type: 'bilibili1', segment_start: 0, segment_end: 7173, url: 'mock-bili-1' }]
+      });
+    }
+    return Array.from({ length: 120 }, () => ({ p: '500.0,1,16777215,bilibili1', m: '弹幕' }));
+  };
+
+  try {
+    addAnime({
+      animeId: 5030376, bangumiId: 'ss46058', animeTitle: '钢铁侠2(2010)【电影】from bilibili',
+      type: 'movie', typeDescription: '电影', source: 'bilibili',
+      links: [{ title: '【bilibili1】 原版', url: 'https://www.bilibili.com/bangumi/play/ep777132@%100' }],
+    });
+    const episode = Globals.animes.find(anime => anime.animeId === 5030376).links[0];
+    const body = await parseResponse(await handleRequest(new MockRequest(
+      urlPrefix + '/api/v2/comment/' + episode.id + '?format=json&duration=true',
+      { method: 'GET' }
+    ), env, undefined, 'offset-combined-test'));
+
+    assert.equal(body.videoDuration, 7543, '链接偏移与规则偏移依次叠加进总时长');
+    assert.equal(body.comments[0].p.split(',')[0], '622.58', '规则百分比以原始片长为基准');
+  } finally {
+    BilibiliSource.prototype.getComments = originalBilibiliGetComments;
+    Globals.episodeIds = [];
+    Globals.commentCache = new Map();
+    Globals.requestHistory = new Map();
   }
 });
 
@@ -692,6 +864,156 @@ test('worker 边缘入口：favicon / robots.txt / OPTIONS 直接返回 204 与 
   }
 });
 
+test('worker Fongmi 弹幕接口：根路径、/danmaku 及尾斜杠写法均可使用', async () => {
+  const headers = { 'content-type': 'application/x-www-form-urlencoded' };
+  const body = 'name=&episode=1';
+
+  for (const path of [
+    '/',
+    '/danmaku',
+    '/danmaku/',
+    '/danmaku/api/v2/fongmi/danmaku',
+    '/danmaku/api/v2/fongmi/danmaku/',
+  ]) {
+    const result = await callWorker(`http://localhost${path}`, { method: 'POST', headers, body });
+    assert.strictEqual(result.status, 200, `${path} 应命中 Fongmi 接口`);
+    assert.deepStrictEqual(result.json, [], `${path} 无标题时应返回空候选列表`);
+  }
+
+  const rootUi = await callWorker('http://localhost/');
+  assert.strictEqual(rootUi.status, 200);
+  assert.match(rootUi.response.headers.get('content-type') || '', /text\/html/, '普通根路径仍需返回管理页面');
+
+  const rootGet = await callWorker('http://localhost/?name=&episode=1');
+  assert.strictEqual(rootGet.status, 200);
+  assert.deepStrictEqual(rootGet.json, [], '带 name 的根路径 GET 应命中 Fongmi 接口');
+
+  const rootWithoutName = await callWorker('http://localhost/?episode=1');
+  assert.match(rootWithoutName.response.headers.get('content-type') || '', /text\/html/, '只有 episode 时仍返回管理页面');
+
+  const tokenEnv = { TOKEN: 'user-token-1' };
+  const tokenRoot = await callWorker('http://localhost/user-token-1', { method: 'POST', headers, body, env: tokenEnv });
+  assert.strictEqual(tokenRoot.status, 200, '自定义 TOKEN 下根地址也应可用');
+  assert.deepStrictEqual(tokenRoot.json, []);
+
+  const missingToken = await callWorker('http://localhost/', { method: 'POST', headers, body, env: tokenEnv });
+  assert.strictEqual(missingToken.status, 401, '自定义 TOKEN 下不能绕过鉴权');
+});
+
+test('worker Fongmi 非空候选：返回的弹幕 URL 可访问 XML，并保留鉴权前缀', async (t) => {
+  resetSearchState();
+  const anime = {
+    animeId: 500010,
+    bangumiId: '500010',
+    animeTitle: 'Fongmi兼容测试番剧',
+    type: 'tvseries',
+    typeDescription: 'TV',
+    imageUrl: '',
+    startDate: '2024-01-01T00:00:00.000Z',
+    episodeCount: 1,
+    rating: 0,
+    isFavorited: false,
+    source: 'tencent',
+    links: [{ id: 31010, url: 'https://v.qq.com/x/cover/fongmi/ep1.html', title: '【qq】 第1集' }],
+  };
+  Globals.searchCache.set(anime.animeTitle, {
+    results: [createSearchResult(anime)],
+    details: [anime],
+    timestamp: Date.now(),
+  });
+  t.mock.method(TencentSource.prototype, 'getComments', async () => [
+    { p: '12.3,1,16777215,qq', m: 'Fongmi回归测试弹幕' },
+  ]);
+
+  const params = { name: anime.animeTitle, episode: '1' };
+  const query = new URLSearchParams(params).toString();
+  const tokenEnv = { TOKEN: 'user-token-1', ADMIN_TOKEN: 'admin-tok' };
+  const requests = [
+    ['GET', `?${query}`, { method: 'GET' }],
+    ['表单 POST', '', { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: query }],
+    ['JSON POST', '', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(params) }],
+  ];
+
+  try {
+    for (const [path, env, prefix] of [
+      ['/', {}, ''],
+      ['/danmaku/', {}, ''],
+      ['/api/v2/fongmi/danmaku', {}, ''],
+      ['/danmaku/api/v2/fongmi/danmaku/', {}, ''],
+      ['/danmaku//api/v2/fongmi/danmaku/', {}, ''],
+      ['/api//v2/fongmi/danmaku', {}, ''],
+      ['/user-token-1', tokenEnv, '/user-token-1'],
+      ['/user-token-1//danmaku//api/v2/fongmi/danmaku/', tokenEnv, '/user-token-1'],
+      ['/admin-tok/', tokenEnv, '/admin-tok'],
+      ['/admin-tok//danmaku//api/v2/fongmi/danmaku/', tokenEnv, '/admin-tok'],
+      ['/danmaku', { TOKEN: 'danmaku' }, '/danmaku'],
+    ]) {
+      for (const [methodLabel, suffix, options] of requests) {
+        const label = `${methodLabel} ${path}`;
+        const result = await callWorker(`http://localhost${path}${suffix}`, { ...options, env });
+        assert.strictEqual(result.status, 200, `${label} 应返回候选`);
+        assert.deepStrictEqual(result.json, [{
+          name: `${anime.animeTitle} - ${anime.links[0].title}`,
+          url: `http://localhost${prefix}/api/v2/comment/31010?format=xml`,
+        }], `${label} 应返回有效的弹幕地址`);
+
+        const comment = await callWorker(result.json[0].url, { env });
+        assert.strictEqual(comment.status, 200, `${label} 的弹幕地址应可访问`);
+        assert.match(comment.response.headers.get('content-type') || '', /xml/, `${label} 应返回 XML`);
+        assert.match(comment.text, /<d\b[^>]*>Fongmi回归测试弹幕<\/d>/, `${label} 应包含弹幕内容`);
+      }
+    }
+  } finally {
+    resetSearchState();
+  }
+});
+
+test('worker Fongmi 请求统计：带 token 的根地址记录一次请求，普通首页不计数', async () => {
+  const previousRecords = Globals.reqRecords;
+  const previousTodayReqNum = Globals.todayReqNum;
+  const tokenEnv = { TOKEN: 'user-token-1', ADMIN_TOKEN: 'admin-tok' };
+
+  try {
+    for (const [path, env] of [
+      ['/', {}],
+      ['/87654321', {}],
+      ['/user-token-1', tokenEnv],
+      ['/user-token-1/', tokenEnv],
+      ['/admin-tok', tokenEnv],
+      ['/admin-tok/', tokenEnv],
+    ]) {
+      Globals.reqRecords = [];
+      Globals.todayReqNum = 0;
+      const ui = await callWorker(`http://localhost${path}`, { env });
+      assert.match(ui.response.headers.get('content-type') || '', /text\/html/);
+      assert.strictEqual(Globals.reqRecords.length, 0, `${path} 普通首页不应记录为弹幕请求`);
+      assert.strictEqual(Globals.todayReqNum, 0);
+
+      for (const method of ['GET', 'POST']) {
+        const url = `http://localhost${path}${method === 'GET' ? '?name=&episode=1' : ''}`;
+        const result = await callWorker(url, {
+          method,
+          env,
+          ...(method === 'POST' ? {
+            headers: { 'content-type': 'application/x-www-form-urlencoded' },
+            body: 'name=&episode=1',
+          } : {}),
+        });
+        assert.strictEqual(result.status, 200);
+        assert.deepStrictEqual(result.json, []);
+        const expectedCount = method === 'GET' ? 1 : 2;
+        assert.strictEqual(Globals.reqRecords.length, expectedCount, `${method} ${path} 应恰好记录一次请求`);
+        assert.strictEqual(Globals.todayReqNum, expectedCount, `${method} ${path} 应增加今日请求数`);
+        assert.strictEqual(Globals.reqRecords.at(-1).method, method);
+        assert.strictEqual(Globals.reqRecords.at(-1).interface, url);
+      }
+    }
+  } finally {
+    Globals.reqRecords = previousRecords;
+    Globals.todayReqNum = previousTodayReqNum;
+  }
+});
+
 test('worker 默认 TOKEN：未知首段视为错误 token 返回 401，已知 API 首段放行', async () => {
   const unknown = await callWorker('http://localhost/not-a-known-path/x');
   assert.strictEqual(unknown.status, 401, '未知首段应按错误 token 处理');
@@ -840,4 +1162,353 @@ test('worker 平台适配层：netlifyHandler / vercelHandler 映射为标准响
   assert.strictEqual(captured.status, 204);
   assert.strictEqual(captured.headers['access-control-allow-origin'], '*');
   assert.strictEqual(captured.body, '');
+});
+
+// ============================================================================
+// 系统管理接口鉴权（#531）：默认 TOKEN 的免 token 兼容不适用于管理接口
+// ============================================================================
+
+const ADMIN_ONLY_PROBES = [
+  ['/api/env/set', 'POST'],
+  ['/api/env/add', 'POST'],
+  ['/api/env/del', 'POST'],
+  ['/api/deploy', 'POST'],
+  ['/api/cache/clear', 'POST'],
+  ['/api/cache/animes', 'GET'],
+  ['/api/logs/clear', 'POST'],
+  ['/api/cookie/status', 'GET'],
+  ['/api/cookie/save', 'POST'],
+  ['/api/cookie/verify', 'POST'],
+  ['/api/cookie/qr/generate', 'POST'],
+  ['/api/cookie/qr/check', 'POST'],
+  ['/api/ai/verify', 'POST'],
+  ['/api/nipaplay/verify', 'POST'],
+  ['/api/title-mapping/refresh', 'POST'],
+  ['/api/auto-match-mapping/refresh', 'POST'],
+];
+
+test('worker 默认 TOKEN 下管理接口无 token 一律 401（默认 token 不是凭据）', async () => {
+  for (const [path, method] of ADMIN_ONLY_PROBES) {
+    const tokenless = await callWorker(`http://localhost${path}`, {
+      method, headers: { 'content-type': 'application/json' }, body: method === 'GET' ? undefined : '{}',
+    });
+    assert.strictEqual(tokenless.status, 401, `${path} 无 token 应被拦截`);
+    assert.strictEqual(tokenless.json.errorCode, 401);
+    assert.match(tokenless.json.errorMessage, /ADMIN_TOKEN/, `${path} 应提示需要 ADMIN_TOKEN`);
+    assert.strictEqual(tokenless.json.message, undefined, `${path} 不应进入处理器（处理器会返回业务 message）`);
+
+    // 显式携带公开的默认 token 同样不构成管理凭据
+    const withDefaultToken = await callWorker(`http://localhost/87654321${path}`, {
+      method, headers: { 'content-type': 'application/json' }, body: method === 'GET' ? undefined : '{}',
+    });
+    assert.strictEqual(withDefaultToken.status, 401, `${path} 携带默认 token 仍应被拦截`);
+  }
+});
+
+test('worker 配置 ADMIN_TOKEN 后管理接口放行，普通业务接口的免 token 兼容不受影响', async () => {
+  const env = { ADMIN_TOKEN: 'admin-tok' };
+
+  const clearCache = await callWorker('http://localhost/admin-tok/api/cache/clear', { method: 'POST', env });
+  assert.strictEqual(clearCache.status, 200);
+  assert.strictEqual(clearCache.json.success, true);
+
+  const clearLogs = await callWorker('http://localhost/admin-tok/api/logs/clear', { method: 'POST', env });
+  assert.strictEqual(clearLogs.status, 200);
+
+  // 通过闸门后落到处理器自身的参数校验（400），证明已放行而不是被鉴权拦下
+  const delEnv = await callWorker('http://localhost/admin-tok/api/env/del', {
+    method: 'POST', env, headers: { 'content-type': 'application/json' }, body: '{}',
+  });
+  assert.strictEqual(delEnv.status, 400);
+  assert.strictEqual(delEnv.json.message, '缺少环境变量名称');
+
+  // 默认 TOKEN 下普通业务接口仍可无 token 访问
+  const reqRecords = await callWorker('http://localhost/api/reqrecords');
+  assert.strictEqual(reqRecords.status, 200);
+  const logs = await callWorker('http://localhost/api/logs');
+  assert.strictEqual(logs.status, 200, 'GET /api/logs 仍可非 admin 读取（内容脱敏）');
+});
+
+test('worker 自定义 TOKEN 下管理接口只接受 ADMIN_TOKEN', async () => {
+  const env = { TOKEN: 'user-token-1', ADMIN_TOKEN: 'admin-tok' };
+
+  const userToken = await callWorker('http://localhost/user-token-1/api/env/set', {
+    method: 'POST', env, headers: { 'content-type': 'application/json' }, body: '{}',
+  });
+  assert.strictEqual(userToken.status, 401, '普通 token 不能访问管理接口');
+  assert.match(userToken.json.errorMessage, /ADMIN_TOKEN/);
+
+  const noToken = await callWorker('http://localhost/api/env/set', {
+    method: 'POST', env, headers: { 'content-type': 'application/json' }, body: '{}',
+  });
+  assert.strictEqual(noToken.status, 401);
+
+  const adminToken = await callWorker('http://localhost/admin-tok/api/env/set', {
+    method: 'POST', env, headers: { 'content-type': 'application/json' }, body: '{}',
+  });
+  assert.strictEqual(adminToken.status, 400, 'ADMIN_TOKEN 应通过闸门并落到处理器参数校验');
+  assert.strictEqual(adminToken.json.message, '缺少环境变量名称');
+});
+
+// ============================================================================
+// 远程剧名映射表
+// ============================================================================
+
+async function resetRemoteTitleMappingState() {
+  Globals.deployPlatform = 'node';
+  Globals.init({});
+  await ensureRemoteTitleMapping();
+}
+
+test.after(async () => {
+  await resetRemoteTitleMappingState();
+  Globals.deployPlatform = '';
+});
+
+test('远程映射表：URL、TXT 解析与北京时间刷新周期', () => {
+  assert.strictEqual(
+    normalizeMappingSourceUrl('https://github.com/alice/danmu-maps/blob/main/mappings.txt'),
+    'https://raw.githubusercontent.com/alice/danmu-maps/main/mappings.txt',
+  );
+  assert.strictEqual(
+    normalizeMappingSourceUrl('https://gist.github.com/alice/abc123def'),
+    'https://gist.githubusercontent.com/alice/abc123def/raw',
+  );
+  assert.strictEqual(
+    normalizeMappingSourceUrl('https://cdn.jsdelivr.net/gh/a/b@main/m.txt'),
+    'https://cdn.jsdelivr.net/gh/a/b@main/m.txt',
+  );
+  assert.throws(() => normalizeMappingSourceUrl('file:///tmp/mappings.txt'), /HTTP\/HTTPS/);
+  assert.throws(() => normalizeMappingSourceUrl('not-a-url'), /有效的 HTTP\/HTTPS/);
+
+  const parsed = parseRemoteTitleMappings([
+    '# 共享剧名映射表',
+    '// 由用户维护',
+    '唐朝诡事录->唐朝诡事录之西行',
+    '"国色芳华" -> 锦绣芳华，',
+    '永生－>永生动画',
+    '庆余年 -> 庆余年(剧集版) # 备注',
+    '无效行没有箭头',
+  ].join('\n'));
+  assert.strictEqual(parsed.size, 4);
+  assert.strictEqual(parsed.get('唐朝诡事录'), '唐朝诡事录之西行');
+  assert.strictEqual(parsed.get('国色芳华'), '锦绣芳华');
+  assert.strictEqual(parsed.get('永生'), '永生动画');
+  assert.strictEqual(parsed.get('庆余年'), '庆余年(剧集版)');
+  assert.strictEqual(parseRemoteTitleMappings('A->B;C->D').size, 2);
+
+  const cases = [
+    ['2026-09-19T21:29:00.000Z', 60 * 1000],
+    ['2026-09-19T21:30:00.000Z', 24 * 60 * 60 * 1000],
+    ['2026-09-19T22:00:00.000Z', 23.5 * 60 * 60 * 1000],
+    ['2026-09-20T00:00:00.000Z', 21.5 * 60 * 60 * 1000],
+  ];
+  for (const [now, expected] of cases) {
+    assert.strictEqual(millisecondsUntilNextShanghaiRefresh(new Date(now)), expected);
+  }
+});
+
+test('远程映射表：本机规则优先，禁用或切换地址后清理旧规则', async () => {
+  const configuredUrl = 'https://maps.example.test/priority.txt';
+  Globals.init({
+    TITLE_MAPPING_TABLE: '本地剧A->本地映射A;本地剧B->本地映射B',
+    TITLE_MAPPING_TABLE_URL: configuredUrl,
+  });
+  await withMockFetch(
+    async () => new Response('本地剧A->远程覆盖A;远程剧X->远程映射X;远程剧Y->远程映射Y', {
+      status: 200,
+      headers: { 'content-type': 'text/plain; charset=utf-8' },
+    }),
+    () => ensureRemoteTitleMapping(),
+  );
+
+  assert.strictEqual(Globals.resolveTitleMapping('本地剧A'), '本地映射A');
+  assert.strictEqual(Globals.resolveTitleMapping('本地剧B'), '本地映射B');
+  assert.strictEqual(Globals.resolveTitleMapping('远程剧X'), '远程映射X');
+  assert.strictEqual(Globals.resolveTitleMapping('远程剧Y'), '远程映射Y');
+  assert.strictEqual(Globals.envs.titleMappingTable.has('远程剧X'), false, '不应复制远端规则到本机表');
+
+  Globals.envs.titleMappingTableUrl = '';
+  await ensureRemoteTitleMapping();
+  assert.strictEqual(Globals.resolveTitleMapping('远程剧X'), null);
+  assert.strictEqual(Globals.resolveTitleMapping('本地剧A'), '本地映射A');
+});
+
+test('远程映射表：Node 启动复用磁盘缓存且不发起网络请求', async () => {
+  const cacheRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'danmu-api-title-mapping-node-'));
+  const originalCwd = process.cwd();
+  const sourceUrl = 'https://maps.example.test/disk-cache.txt';
+  try {
+    process.chdir(cacheRoot);
+    await fs.mkdir(path.join(cacheRoot, '.cache'), { recursive: true });
+    await fs.writeFile(
+      path.join(cacheRoot, '.cache', 'title-mapping-remote.json'),
+      JSON.stringify({ url: sourceUrl, text: '缓存剧->缓存映射' }),
+      'utf8',
+    );
+
+    Globals.deployPlatform = 'node';
+    Globals.init({
+      TITLE_MAPPING_TABLE: '本地剧->本地值',
+      TITLE_MAPPING_TABLE_URL: sourceUrl,
+    });
+    let requests = 0;
+    await withMockFetch(async () => {
+      requests++;
+      throw new Error('不应在有效磁盘缓存存在时联网');
+    }, () => ensureRemoteTitleMapping());
+
+    assert.strictEqual(requests, 0);
+    assert.strictEqual(Globals.resolveTitleMapping('缓存剧'), '缓存映射');
+    assert.strictEqual(Globals.resolveTitleMapping('本地剧'), '本地值');
+  } finally {
+    process.chdir(originalCwd);
+    await fs.rm(cacheRoot, { recursive: true, force: true });
+  }
+});
+
+test('远程映射表：Node 手动刷新下载、生效并写入磁盘缓存', async () => {
+  const cacheRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'danmu-api-title-mapping-refresh-'));
+  const originalCwd = process.cwd();
+  const sourceUrl = 'https://maps.example.test/manual-refresh.txt';
+  try {
+    process.chdir(cacheRoot);
+    Globals.deployPlatform = 'node';
+    Globals.init({
+      TITLE_MAPPING_TABLE: '本地剧->本地优先',
+      TITLE_MAPPING_TABLE_URL: sourceUrl,
+    });
+    let requestedUrl = '';
+    const result = await withMockFetch(async url => {
+      requestedUrl = String(url);
+      return new Response('本地剧->远程值\n下载剧->下载映射', {
+        status: 200,
+        headers: { 'content-type': 'text/plain; charset=utf-8' },
+      });
+    }, () => refreshRemoteTitleMappingNow());
+
+    assert.deepStrictEqual(result, { success: true, count: 2, status: 200 });
+    assert.strictEqual(requestedUrl, sourceUrl);
+    assert.strictEqual(Globals.resolveTitleMapping('本地剧'), '本地优先');
+    assert.strictEqual(Globals.resolveTitleMapping('下载剧'), '下载映射');
+    const cache = JSON.parse(
+      await fs.readFile(path.join(cacheRoot, '.cache', 'title-mapping-remote.json'), 'utf8'),
+    );
+    assert.strictEqual(cache.url, sourceUrl);
+    assert.match(cache.text, /下载剧->下载映射/);
+  } finally {
+    process.chdir(originalCwd);
+    await fs.rm(cacheRoot, { recursive: true, force: true });
+  }
+});
+
+test('远程映射表：Serverless 冷启动同步下载一次并复用实例内存', async () => {
+  const sourceUrl = 'https://maps.example.test/serverless.txt';
+  Globals.deployPlatform = 'vercel';
+  Globals.init({ TITLE_MAPPING_TABLE_URL: sourceUrl });
+  let requests = 0;
+
+  await withMockFetch(async () => {
+    requests++;
+    return new Response('冷启动剧->远程映射剧', { status: 200 });
+  }, async () => {
+    await Promise.all([ensureRemoteTitleMapping(), ensureRemoteTitleMapping()]);
+    assert.strictEqual(requests, 1);
+    assert.strictEqual(Globals.resolveTitleMapping('冷启动剧'), '远程映射剧');
+
+    await ensureRemoteTitleMapping();
+    assert.strictEqual(requests, 1, '已加载到实例内存后不应重复下载');
+  });
+});
+
+test('远程映射表：手动搜索保持原始关键词，不应用标题映射', async () => {
+  resetSearchState();
+  const env = {
+    TITLE_MAPPING_TABLE: '原始标题->映射标题',
+    SOURCE_ORDER: 'douban',
+  };
+  Globals.init(env);
+  const anime = createFavoriteAnime('原始标题', 1, 919001);
+  Globals.searchCache = new Map();
+  setSearchCache('原始标题', [favoriteSearchResult(anime)], new Map([[anime.animeId, anime]]));
+
+  const response = await callWorker(
+    `http://localhost/api/v2/search/anime?keyword=${encodeURIComponent('原始标题')}`,
+    { env },
+  );
+
+  assert.strictEqual(response.status, 200);
+  assert.strictEqual(response.json.animes[0].animeId, anime.animeId);
+  assert.strictEqual(Globals.searchCache.has('映射标题'), false);
+});
+
+test('远程映射表：刷新接口只接受 ADMIN_TOKEN，并返回更新结果', async () => {
+  const env = {
+    TOKEN: 'user-token-1',
+    ADMIN_TOKEN: 'admin-tok',
+    TITLE_MAPPING_TABLE_URL: 'https://maps.example.test/admin-refresh.txt',
+  };
+
+  const anonymous = await callWorker('http://localhost/api/title-mapping/refresh', { method: 'POST', env });
+  assert.strictEqual(anonymous.status, 401);
+
+  const userToken = await callWorker('http://localhost/user-token-1/api/title-mapping/refresh', {
+    method: 'POST',
+    env,
+  });
+  assert.strictEqual(userToken.status, 401);
+
+  const admin = await withMockFetch(
+    async () => new Response('原始剧->映射剧', {
+      status: 200,
+      headers: { 'content-type': 'text/plain; charset=utf-8' },
+    }),
+    () => callWorker('http://localhost/admin-tok/api/title-mapping/refresh', { method: 'POST', env }),
+  );
+  assert.strictEqual(admin.status, 200);
+  assert.strictEqual(admin.json.success, true);
+  assert.strictEqual(admin.json.count, 1);
+});
+
+test('远程季集映射表：刷新接口保留路径、只接受 ADMIN_TOKEN，并返回更新结果', async () => {
+  Globals.deployPlatform = 'vercel';
+  const env = {
+    TOKEN: 'user-token-1',
+    ADMIN_TOKEN: 'admin-tok',
+    AUTO_MATCH_MAPPING_TABLE_URL: 'https://maps.example.test/admin-season-refresh.txt',
+  };
+
+  try {
+    const anonymous = await callWorker('http://localhost/api/auto-match-mapping/refresh', { method: 'POST', env });
+    assert.strictEqual(anonymous.status, 401);
+
+    const userToken = await callWorker('http://localhost/user-token-1/api/auto-match-mapping/refresh', {
+      method: 'POST',
+      env,
+    });
+    assert.strictEqual(userToken.status, 401);
+
+    const admin = await withMockFetch(
+      async () => new Response([
+        '永生 S05E02->永生 S01E58',
+        '一念永恒 S01E53->一念永恒 S02E01',
+      ].join('\n'), {
+        status: 200,
+        headers: { 'content-type': 'text/plain; charset=utf-8' },
+      }),
+      () => callWorker('http://localhost/admin-tok/api/auto-match-mapping/refresh', { method: 'POST', env }),
+    );
+    assert.strictEqual(admin.status, 200);
+    assert.strictEqual(admin.json.success, true);
+    assert.strictEqual(admin.json.count, 2);
+
+    const unconfigured = await callWorker('http://localhost/admin-tok/api/auto-match-mapping/refresh', {
+      method: 'POST',
+      env: { ADMIN_TOKEN: 'admin-tok' },
+    });
+    assert.strictEqual(unconfigured.status, 400);
+    assert.match(unconfigured.json.errorMessage, /未配置 AUTO_MATCH_MAPPING_TABLE_URL/);
+  } finally {
+    resetRemoteAutoMatchMappingForTests();
+  }
 });

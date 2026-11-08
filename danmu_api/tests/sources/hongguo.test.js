@@ -4,6 +4,8 @@
 import test from 'node:test';
 import assert from 'node:assert';
 import { getSourceByKey } from '../../sources/registry.js';
+import { Globals } from '../../configs/globals.js';
+import { resetSearchState } from '../helpers/context.js';
 import {
   createArgus, createLadon, buildGorgonSeed, transformGorgonSeed, signHongguoRequest,
   createHongguoEpisodeId, parseHongguoEpisodeId, createHongguoSeriesId, parseHongguoSeriesId,
@@ -12,6 +14,96 @@ import {
 
 const hongguoSource = getSourceByKey('hongguo');
 
+test('hongguo merged collection exposes the real episode count before download', async (t) => {
+  resetSearchState();
+  const previousMergeAll = Globals.envs.hongguoMergeAllEpisodes;
+  Globals.envs.hongguoMergeAllEpisodes = true;
+  t.after(() => {
+    Globals.envs.hongguoMergeAllEpisodes = previousMergeAll;
+    resetSearchState();
+  });
+  t.mock.method(hongguoSource, 'getEpisodes', async () => ({
+    episodes: [
+      { index: 1, vid: 'v1', duration: 30, commentCount: 1 },
+      { index: 2, vid: 'v2', duration: 30, commentCount: 2 },
+      { index: 3, vid: 'v3', duration: 30, commentCount: 3 },
+    ],
+    year: 2026,
+    imageUrl: '',
+  }));
+
+  const detailStore = new Map();
+  const results = await hongguoSource.handleAnimes([
+    { seriesId: 'collection-1', name: '合集测试', episodeCount: 3, year: 2026, imageUrl: '' },
+  ], '合集测试', [], detailStore);
+  assert.equal(results.length, 1);
+  assert.equal(results[0].episodeCount, 3);
+  const detail = [...detailStore.values()][0];
+  assert.equal(detail.episodeCount, 3);
+  assert.equal(detail.links.length, 1);
+  assert.match(detail.links[0].title, /全集（共3集）/);
+});
+
+test('hongguo comment windows reuse pending and completed requests', async (t) => {
+  hongguoSource.commentWindowCache.clear();
+  hongguoSource.pendingCommentWindows.clear();
+  let requests = 0;
+  t.mock.method(hongguoSource, 'request', async () => {
+    requests++;
+    await new Promise(resolve => setTimeout(resolve, 5));
+    return {
+      code: 0,
+      data: {
+        data_list: [],
+        common_list_info: { cursor: '', has_more: false },
+        extra: { next_query_danmaku_list_time: 30000 },
+      },
+    };
+  });
+  const info = { seriesId: 'series-cache', vid: 'vid-cache', duration: 30 };
+  const [first, second] = await Promise.all([
+    hongguoSource.fetchCommentWindow(info, 0, ''),
+    hongguoSource.fetchCommentWindow(info, 0, ''),
+  ]);
+  const third = await hongguoSource.fetchCommentWindow(info, 0, '');
+  assert.equal(requests, 1);
+  assert.deepEqual(first, second);
+  assert.deepEqual(second, third);
+});
+
+test('hongguo collection skips confirmed empty episodes and keeps partial successes', async (t) => {
+  hongguoSource.pendingSeriesDanmu.clear();
+  hongguoSource.seriesDanmuCache.clear();
+  const getEpisodes = t.mock.method(hongguoSource, 'getEpisodes', async () => ({
+    episodes: [
+      { index: 1, vid: 'empty', duration: 30, commentCount: 0 },
+      { index: 2, vid: 'failed', duration: 30, commentCount: 2 },
+      { index: 3, vid: 'success', duration: 30, commentCount: null },
+    ],
+  }));
+  const fetched = [];
+  t.mock.method(hongguoSource, 'getDanmuForEpisode', async (info) => {
+    fetched.push(info.vid);
+    if (info.vid === 'failed') throw new Error('upstream failed');
+    return [{ commentId: 'ok', text: 'success', offsetMs: 5000, diggCount: 0 }];
+  });
+  const comments = await hongguoSource.getSeriesDanmu('series-partial');
+  assert.deepEqual(fetched.sort(), ['failed', 'success']);
+  assert.equal(comments.length, 1);
+  assert.equal(comments[0].offsetMs, 65000);
+  const cachedComments = await hongguoSource.getSeriesDanmu('series-partial');
+  assert.deepEqual(cachedComments, comments);
+  assert.equal(getEpisodes.mock.callCount(), 1);
+  assert.deepEqual(fetched.sort(), ['failed', 'success']);
+  const segments = await hongguoSource.getSeriesDanmuSegments('series-partial');
+  assert.deepEqual(segments.segmentList.map(item => [item.segment_start, item.segment_end]), [
+    [30, 60],
+    [60, 90],
+  ]);
+  assert.equal(segments.duration, 90);
+  assert.equal(getEpisodes.mock.callCount(), 2);
+});
+
 test('GET hongguo danmu segments', async () => {
   const episodeId = 'hongguo:v1:series-1:vid-1:60';
   const res = await hongguoSource.getComments(episodeId, 'hongguo', true);
@@ -19,6 +111,92 @@ test('GET hongguo danmu segments', async () => {
   assert.equal(res.duration, 60);
   assert.equal(res.segmentList.length, 2);
   assert.notEqual(res.segmentList[0].url, res.segmentList[1].url);
+});
+
+test('hongguo web search sends browser headers and parses results', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url, options = {}) => {
+    calls.push({ url: String(url), headers: { ...options.headers } });
+    return {
+      ok: true,
+      status: 200,
+      url: String(url),
+      headers: new Headers({ 'content-type': 'application/json' }),
+      text: async () => JSON.stringify({
+        searchList: [{
+          video_data: {
+            series_id: '7699120345449499672',
+            series_title: '全员请长假，我反手注销了公司',
+            episode_cnt: 95,
+            create_time: '1792591145',
+          },
+        }],
+      }),
+    };
+  };
+
+  try {
+    const results = await hongguoSource.search('逆转');
+    assert.strictEqual(results.length, 1);
+    assert.strictEqual(results[0].seriesId, '7699120345449499672');
+    assert.strictEqual(results[0].name, '全员请长假，我反手注销了公司');
+    assert.strictEqual(results[0].episodeCount, 95);
+
+    assert.ok(calls.length > 0);
+    for (const call of calls) {
+      assert.match(call.url, /^https:\/\/hongguoduanju\.com\/api\/search\/result\//);
+      assert.match(call.headers['user-agent'], /^Mozilla\/5\.0/);
+      assert.doesNotMatch(call.headers['user-agent'], /com\.phoenix\.read/);
+      assert.strictEqual(call.headers.referer, 'https://hongguoduanju.com/');
+      assert.strictEqual(call.headers.accept, 'application/json, text/plain, */*');
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('hongguo SSR search fallback sends browser headers for HTML', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url, options = {}) => {
+    calls.push({ url: String(url), headers: { ...options.headers } });
+    if (String(url).includes('/api/search/result/')) {
+      return {
+        ok: false,
+        status: 403,
+        url: String(url),
+        headers: new Headers({ 'content-type': 'application/json' }),
+        text: async () => JSON.stringify({ code: 'search_rejected' }),
+      };
+    }
+    return {
+      ok: true,
+      status: 200,
+      url: String(url),
+      headers: new Headers({ 'content-type': 'text/html' }),
+      text: async () => '<script>{"searchList":[{"video_data":{"series_id":"7450384880434678809",' +
+        '"series_title":"逆转","episode_cnt":100,"create_time":"1734677907"}}]}</script>',
+    };
+  };
+
+  try {
+    const results = await hongguoSource.search('逆转');
+    assert.strictEqual(results.length, 1);
+    assert.strictEqual(results[0].seriesId, '7450384880434678809');
+    assert.strictEqual(calls.length, 2);
+
+    const fallbackCall = calls[1];
+    assert.match(fallbackCall.url, /^https:\/\/hongguoduanju\.com\/search\//);
+    assert.match(fallbackCall.headers['user-agent'], /^Mozilla\/5\.0/);
+    assert.strictEqual(fallbackCall.headers.referer, 'https://hongguoduanju.com/');
+    assert.strictEqual(
+      fallbackCall.headers.accept,
+      'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 // 以下为红果源的纯函数用例：签名算法、gorgon 种子与剧集/全集 ID 编解码，全部离线。
