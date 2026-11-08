@@ -1,4 +1,4 @@
-mobile/index.js -text
+mobile/index.js -text whitespace=cr-at-eol
 mobile/upstream.cjs -text
 mobile/manifest.json -text
 mobile/manifest.sig -text
