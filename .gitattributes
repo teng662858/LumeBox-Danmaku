@@ -1,0 +1,4 @@
+mobile/index.js -text
+mobile/upstream.cjs -text
+mobile/manifest.json -text
+mobile/manifest.sig -text
